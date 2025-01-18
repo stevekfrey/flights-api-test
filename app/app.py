@@ -3,47 +3,109 @@ import requests
 import json
 from openai import OpenAI
 from pprint import pprint
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field
 from datetime import datetime
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # Set up the API key and endpoint
-YOUR_API_KEY = "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"  # Replace with your actual Perplexity API key
+YOUR_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 API_ENDPOINT = "https://api.perplexity.ai"
 
 
+### LOCAL 
 current_datetime = datetime.now()
 
 user_location = "San Francisco, CA"
+##### 
+
+########################################################
+## Data model 
+########################################################
+
+class TravelResponse(BaseModel):
+    event_name: str = Field(
+        description="Name of the event or destination"
+    )
+    response: str = Field(
+        description="Status or clarifying question. Set to 'success' if query is clear, otherwise contains a clarifying question (e.g., 'Did you mean Washington State or Washington, D.C.?')"
+    )
+    city: str = Field(
+        description="Destination city where the event/venue is located"
+    )
+    airports: List[str] = Field(
+        description="List of nearby airports, ordered by distance from the event/venue location"
+    )
+    event_start_date: Optional[str] = Field(
+        description="Start date of the event, sourced from official website or data. Should not be guessed if not available",
+        default=None
+    )
+    event_end_date: Optional[str] = Field(
+        description="End date of the event, sourced from official website or data. Should not be guessed if not available",
+        default=None
+    )
+    recommended_flight_start_date: Optional[str] = Field(
+        description="Recommended departure date, typically day before event start. Accounts for travel time from user location and typical pre-event activities",
+        default=None
+    )
+    recommended_flight_end_date: Optional[str] = Field(
+        description="Recommended return date, typically day after event end. Can be adjusted based on user-specified date ranges",
+        default=None
+    )
+    sources: List[str] = Field(
+        description="List of ALL the sources used to verify event details, dates, and location information",
+        default_factory=list
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "event_name": "Coachella 2024",
+                "response": "success",
+                "city": "Indio, CA",
+                "airports": ["PSP", "LAX", "SAN"],
+                "event_start_date": "2024-04-12",
+                "event_end_date": "2024-04-21",
+                "recommended_flight_start_date": "2024-04-11",
+                "recommended_flight_end_date": "2024-04-22",
+                "sources": ["coachella.com", "airports.com"]
+            }
+        }
 
 
-# Define the prompt
+travel_response_schema = TravelResponse.model_json_schema()
+travel_response_schema_str = str(json.dumps(travel_response_schema, indent=2))
+
+print("travel response model schema: \n")
+print(travel_response_schema_str)
+
+
+########################################################
+## Prompt 
+########################################################
+
 PROMPT_TEMPLATE = """
 here is a user's query request to book a flight to a location, airport, city, venue, conference, event, landmark, etc. if they don't already specify the city, please search the internet to find the CITY associated with the (venue, conference, event, landmark, etc) and the AIRPORTS nearby. If there are multiple /events with the same name, if the user didn't specify the date/year of the event and there are different locations, or if it's otherwise unclear, please use "response" to ask for clarification. The current date and time is {current_datetime}. To think about travel times, the user's location is {user_location}.
 
 You  must ONLY respond with valid JSON that follows this schema:
-{
-"event_name": "string",
-"response": "string", # notice ways the user's query could be unclear. if clear, response is "success." if unclear, response is a clarifying question. For example: "there are two places in the US named "Washington", did you mean Washington State (west coast) or Washington, D.C (east coast)?" or "there are two Edge City events in 2025, did you mean the February in San Francisco or the June in Texas?". 
-"city": "string", 
-"airports": ["string", "string", ...], # in order of distance from the LOCATION of the event or venue 
-"event_start_date": "string", #look for the specific START date of the event from its website and online data, don't guess. 
-"event_end_date": "string", # look for the specific END date of the event from its website and online data, don't guess. but if the user specifies a date just respond with that date.
-"recommended_flight_start_date": "string", #based on how long to travel to the event, so they arrive on the day of the event or the day before. but if the user specifies a date or time range then respond with a reasonable date based on that, leaving long enough to travel from the user's location to the destination, and to do any typical activities at the location. Always give a specific date. 
-"recommended_flight_end_date": "string", #based on how long to travel back from the event, so they leave on the day after the event or the day after the event, but if the user specifies a date or time range then respond with a reasonable date based on that. Always give specific dates
-"sources": ["string", "string", ...], # list of sources you used to find the event, city, airports, and dates
-}
+{travel_response_schema_str}
 
 No explanations, no code fences, or ```json fences—just a single JSON object. If unclear, ask for clarification in the "response" field.
 
-Another example: 
----
-{
-"response": "success" 
-"city": "Indio, CA"
-"airports": ["PSP", "LAX"],
-}
----
+Example response:
+{{
+    "event_name": "Coachella 2024",
+    "response": "success",
+    "city": "Indio, CA",
+    "airports": ["PSP", "LAX", "SAN"],
+    "event_start_date": "2024-04-12",
+    "event_end_date": "2024-04-21",
+    "recommended_flight_start_date": "2024-04-11",
+    "recommended_flight_end_date": "2024-04-22",
+    "sources": ["coachella.com", "airports.com"]
+}}
 """
 
 ########################################################
@@ -74,7 +136,7 @@ def extract_json_from_chat_response(response):
 
 
 ########################################################
-## MAIN FUNCTION 
+## MAIN QUERY FUNCTION 
 ########################################################
 
 def get_structured_perplexity_response(prompt, user_input):
@@ -96,13 +158,22 @@ def get_structured_perplexity_response(prompt, user_input):
 
     # chat completion without streaming
     response = client.chat.completions.create(
-        model="llama-3.1-sonar-large-128k-online",
+        model="llama-3.1-sonar-huge-128k-online",
         messages=messages,
     )
     response_content = response.choices[0].message.content
     cleaned_structured_response = extract_json_from_chat_response(response_content)
 
-    return cleaned_structured_response 
+    print("cleaned_structured_response: \n", cleaned_structured_response)
+    
+    # validate cleaned model response against TravelResponseschema
+    try:
+        # Parse JSON string and validate against TravelResponse model
+        validated_response = TravelResponse.model_validate_json(cleaned_structured_response)
+        return validated_response.model_dump_json()  # Return validated JSON string
+    except Exception as e:
+        print(f"Validation error: {e}")
+        return None
 
 
 ########################################################
@@ -116,27 +187,26 @@ if __name__ == "__main__":
     print (f"\n\nPrompt: {TEST_USER_INPUT}")
     print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
 
+    TEST_USER_INPUT = "book a flight to Coachella this year" 
+    print (f"\n\nPrompt: {TEST_USER_INPUT}")
+    print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
 
-    # TEST_USER_INPUT = "book a flight to Coachella this year" 
-    # print (f"\n\nPrompt: {TEST_USER_INPUT}")
-    # print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
+    TEST_USER_INPUT = "book a round trip to the next Starship launch "
+    print (f"\n\nPrompt: {TEST_USER_INPUT}")
+    print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
 
-    # TEST_USER_INPUT = "book a round trip to the next Starship launch "
-    # print (f"\n\nPrompt: {TEST_USER_INPUT}")
-    # print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
+    TEST_USER_INPUT = "let's go to the 2025 Super Bowl "
+    print (f"\n\nPrompt: {TEST_USER_INPUT}")
+    print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
 
-    # TEST_USER_INPUT = "let's go to the 2025 Super Bowl "
-    # print (f"\n\nPrompt: {TEST_USER_INPUT}")
-    # print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
+    TEST_USER_INPUT = "book a flight to the 2025 ICML conference"
+    print (f"\n\nPrompt: {TEST_USER_INPUT}")
+    print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
 
-    # TEST_USER_INPUT = "book a flight to the 2025 ICML conference"
-    # print (f"\n\nPrompt: {TEST_USER_INPUT}")
-    # print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
+    TEST_USER_INPUT = "book a flight to visit the world's tallest skyscraper for 2 days"
+    print (f"\n\nPrompt: {TEST_USER_INPUT}")
+    print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
 
-    # TEST_USER_INPUT = "book a flight to visit the world's tallest skyscraper for 2 days"
-    # print (f"\n\nPrompt: {TEST_USER_INPUT}")
-    # print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
-
-    # TEST_USER_INPUT = "book a flight to the soonest possible Taylor Swift concert"
-    # print (f"\n\nPrompt: {TEST_USER_INPUT}")
-    # print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
+    TEST_USER_INPUT = "book a flight to the soonest possible Taylor Swift concert"
+    print (f"\n\nPrompt: {TEST_USER_INPUT}")
+    print("Response: \n",get_structured_perplexity_response(PROMPT_TEMPLATE, TEST_USER_INPUT))
